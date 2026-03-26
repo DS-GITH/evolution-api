@@ -78,13 +78,11 @@ class ChatwootImport {
     return this.historyMessages.get(instance.instanceName)?.length ?? 0;
   }
 
-  public async importHistoryContacts(instance: InstanceDto, provider: ChatwootDto) {
+  public async importHistoryContacts(instance: InstanceDto, provider: ChatwootDto, pgClient: any) {
     try {
       if (this.getHistoryMessagesLenght(instance) > 0) {
         return;
       }
-
-      const pgClient = postgresClient.getChatwootConnection();
 
       let totalContactsImported = 0;
 
@@ -176,7 +174,7 @@ class ChatwootImport {
     }
   }
 
-  public async getExistingSourceIds(sourceIds: string[], conversationId?: number): Promise<Set<string>> {
+  public async getExistingSourceIds(sourceIds: string[], pgClient: any, conversationId?: number): Promise<Set<string>> {
     try {
       const existingSourceIdsSet = new Set<string>();
 
@@ -186,7 +184,6 @@ class ChatwootImport {
 
       // Ensure all sourceIds are consistently prefixed with 'WAID:' as required by downstream systems and database queries.
       const formattedSourceIds = sourceIds.map((sourceId) => `WAID:${sourceId.replace('WAID:', '')}`);
-      const pgClient = postgresClient.getChatwootConnection();
 
       const params = conversationId ? [formattedSourceIds, conversationId] : [formattedSourceIds];
 
@@ -206,16 +203,73 @@ class ChatwootImport {
     }
   }
 
+  public async syncLostMessages(
+    instance: InstanceDto,
+    chatwootService: ChatwootService,
+    inbox: any,
+    messagesRaw: any[],
+    pgClient: any,
+  ) {
+    try {
+      const messagesDeleted: string[] = [];
+      const messagesOrdered = messagesRaw.sort((a, b) => a.messageTimestamp - b.messageTimestamp);
+      const messagesByPhoneNumber = this.createMessagesMapByPhoneNumber(messagesOrdered);
+
+      if (messagesByPhoneNumber.size > 0) {
+        const phoneNumbersWithTimestamp = new Map<string, firstLastTimestamp>();
+        messagesByPhoneNumber.forEach((messages: any[], phoneNumber: string) => {
+          phoneNumbersWithTimestamp.set(phoneNumber, {
+            first: messages[0]?.messageTimestamp,
+            last: messages[messages.length - 1]?.messageTimestamp,
+          });
+        });
+
+        const fksByNumber = await this.selectOrCreateFksFromChatwoot(
+          { accountId: messagesOrdered[0].accountId } as any,
+          inbox,
+          phoneNumbersWithTimestamp,
+          messagesByPhoneNumber,
+          pgClient,
+        );
+
+        for (const [phoneNumber, messages] of messagesByPhoneNumber) {
+          const fksChatwoot = fksByNumber.get(phoneNumber);
+          if (!fksChatwoot?.conversation_id) continue;
+
+          for (const message of messages) {
+            const content = this.getContentMessage(chatwootService, message);
+            const bindValues = [
+              content,
+              fksChatwoot.conversation_id,
+              'WAID:' + message.key.id,
+              message.messageTimestamp,
+            ];
+
+            const sql = `INSERT INTO messages (content, processed_message_content, account_id, inbox_id, conversation_id, message_type, private, content_type, sender_type, sender_id, source_id, created_at, updated_at)
+                         SELECT $1, $1, account_id, inbox_id, $2, (CASE WHEN ${message.key.fromMe ? 'TRUE' : 'FALSE'} THEN 1 ELSE 0 END), FALSE, 0, (CASE WHEN ${message.key.fromMe ? 'TRUE' : 'FALSE'} THEN 'User' ELSE 'Contact' END), (CASE WHEN ${message.key.fromMe ? 'TRUE' : 'FALSE'} THEN (SELECT id FROM users WHERE email = (SELECT email FROM account_users WHERE account_id = (SELECT account_id FROM conversations WHERE id = $2) LIMIT 1)) ELSE (SELECT contact_id FROM conversations WHERE id = $2) END), $3, to_timestamp($4), to_timestamp($4)
+                         FROM conversations WHERE id = $2
+                         ON CONFLICT DO NOTHING`;
+            await pgClient.query(sql, bindValues);
+          }
+        }
+      }
+      return messagesDeleted;
+    } catch (error) {
+      this.logger.error(`Error on sync lost messages: ${error.toString()}`);
+      return [];
+    }
+  }
+
   public async importHistoryMessages(
     instance: InstanceDto,
     chatwootService: ChatwootService,
     inbox: inbox,
     provider: ChatwootModel,
+    pgClient: any,
   ) {
     try {
-      const pgClient = postgresClient.getChatwootConnection();
 
-      const chatwootUser = await this.getChatwootUser(provider);
+      const chatwootUser = await this.getChatwootUser(provider, pgClient);
       if (!chatwootUser) {
         throw new Error('User not found to import messages.');
       }
@@ -253,7 +307,10 @@ class ChatwootImport {
         });
       });
 
-      const existingSourceIds = await this.getExistingSourceIds(messagesOrdered.map((message: any) => message.key.id));
+      const existingSourceIds = await this.getExistingSourceIds(
+        messagesOrdered.map((message: any) => message.key.id),
+        pgClient,
+      );
       messagesOrdered = messagesOrdered.filter((message: any) => !existingSourceIds.has(message.key.id));
       // processing messages in batch
       const batchSize = 4000;
@@ -268,6 +325,7 @@ class ChatwootImport {
             inbox,
             phoneNumbersWithTimestamp,
             messagesByPhoneNumber,
+            pgClient,
           );
 
           // inserting messages in chatwoot db
@@ -336,7 +394,7 @@ class ChatwootImport {
         ignoreJids: Array.isArray(provider.ignoreJids) ? provider.ignoreJids.map((event) => String(event)) : [],
       };
 
-      this.importHistoryContacts(instance, providerData);
+      this.importHistoryContacts(instance, providerData, pgClient);
 
       return totalMessagesImported;
     } catch (error) {
@@ -352,8 +410,8 @@ class ChatwootImport {
     inbox: inbox,
     phoneNumbersWithTimestamp: Map<string, firstLastTimestamp>,
     messagesByPhoneNumber: Map<string, Message[]>,
+    pgClient: any,
   ): Promise<Map<string, FksChatwoot>> {
-    const pgClient = postgresClient.getChatwootConnection();
 
     const bindValues = [provider.accountId, inbox.id];
     const phoneNumberBind = Array.from(messagesByPhoneNumber.keys())
@@ -439,9 +497,8 @@ class ChatwootImport {
     return new Map(fksFromChatwoot.rows.map((item: FksChatwoot) => [item.phone_number, item]));
   }
 
-  public async getChatwootUser(provider: ChatwootModel): Promise<ChatwootUser> {
+  public async getChatwootUser(provider: ChatwootModel, pgClient: any): Promise<ChatwootUser> {
     try {
-      const pgClient = postgresClient.getChatwootConnection();
 
       const sqlUser = `SELECT owner_type AS user_type, owner_id AS user_id
                          FROM access_tokens
@@ -475,10 +532,10 @@ class ChatwootImport {
   public async getContactsOrderByRecentConversations(
     inbox: inbox,
     provider: ChatwootModel,
+    pgClient: any,
     limit = 50,
   ): Promise<{ id: number; phone_number: string; identifier: string }[]> {
     try {
-      const pgClient = postgresClient.getChatwootConnection();
 
       const sql = `SELECT contacts.id, contacts.identifier, contacts.phone_number
                      FROM conversations
@@ -567,8 +624,7 @@ class ChatwootImport {
     return this.isGroup(remoteJid) || remoteJid === 'status@broadcast' || remoteJid === '0@s.whatsapp.net';
   }
 
-  public updateMessageSourceID(messageId: string | number, sourceId: string) {
-    const pgClient = postgresClient.getChatwootConnection();
+  public updateMessageSourceID(messageId: string | number, sourceId: string, pgClient: any) {
 
     const sql = `UPDATE messages SET source_id = $1, status = 0, created_at = NOW(), updated_at = NOW() WHERE id = $2;`;
 
